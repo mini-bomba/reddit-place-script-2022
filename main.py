@@ -1,6 +1,8 @@
 import os
 import os.path
 import math
+from datetime import datetime
+
 import requests
 import json
 import time
@@ -52,11 +54,16 @@ def closest_color(target_rgb, rgb_colors_array_in):
 
 # method to draw a pixel at an x, y coordinate in r/place with a specific color
 def set_pixel_and_check_ratelimit(
-    access_token_in, x, y, color_index_in=18, canvas_index=0
+    access_token_in, x, y, color_index_in=18
 ):
     logging.info(
         f"Attempting to place {color_id_to_name(color_index_in)} pixel at {x}, {y}"
     )
+    canvas_index = 0
+    if x >= 1000:
+        x -= 1000
+        canvas_index = 1
+
 
     url = "https://gql-realtime-2.reddit.com/query"
 
@@ -116,7 +123,36 @@ def set_pixel_and_check_ratelimit(
     # code.interact(local=locals())
 
     # Reddit returns time in ms and we need seconds, so divide by 1000
-    return waitTime / 1000
+    return datetime.fromtimestamp(waitTime / 1000)
+
+
+def get_timeout(access_token_in):
+    url = "https://gql-realtime-2.reddit.com/query"
+
+    payload = json.dumps(
+        {
+            "operationName": "getUserCooldown",
+            "variables": {
+                "input": {
+                    "actionName": "r/replace:get_user_cooldown"
+                }
+            },
+            "query": "mutation getUserCooldown($input: ActInput!) {\n  act(input: $input) {\n    data {\n      ... on BasicMessage {\n        id\n        data {\n          ... on GetUserCooldownResponseMessageData {\n            nextAvailablePixelTimestamp\n            __typename\n          }\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n"
+        }
+    )
+    headers = {
+        "origin": "https://hot-potato.reddit.com",
+        "referer": "https://hot-potato.reddit.com/",
+        "apollographql-client-name": "mona-lisa",
+        "Authorization": "Bearer " + access_token_in,
+        "Content-Type": "application/json",
+    }
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+    logging.debug(f"Received response: {response.text}")
+    data = response.json()['data']['act']['data'][0]['data']
+    return datetime.fromtimestamp(data['nextAvailablePixelTimestamp'] / 1000) \
+        if data['nextAvailablePixelTimestamp'] is not None else datetime.now()
 
 
 def get_board(access_token_in):
@@ -177,28 +213,54 @@ def get_board(access_token_in):
             }
         )
     )
+    ws.send(
+        json.dumps(
+            {
+                "id": "2",
+                "type": "start",
+                "payload": {
+                    "variables": {
+                        "input": {
+                            "channel": {
+                                "teamOwner": "AFD2022",
+                                "category": "CANVAS",
+                                "tag": "1",
+                            }
+                        }
+                    },
+                    "extensions": {},
+                    "operationName": "replace",
+                    "query": "subscription replace($input: SubscribeInput!) {\n  subscribe(input: $input) {\n    id\n    ... on BasicMessage {\n      data {\n        __typename\n        ... on FullFrameMessageData {\n          __typename\n          name\n          timestamp\n        }\n        ... on DiffFrameMessageData {\n          __typename\n          name\n          currentTimestamp\n          previousTimestamp\n        }\n      }\n      __typename\n    }\n    __typename\n  }\n}\n",
+                },
+            }
+        )
+    )
 
-    file = ""
+    files = []
     while True:
         temp = json.loads(ws.recv())
         if temp["type"] == "data":
             msg = temp["payload"]["data"]["subscribe"]
             if msg["data"]["__typename"] == "FullFrameMessageData":
-                file = msg["data"]["name"]
-                break
+                files.append(msg["data"]["name"])
+                if len(files) >= 2:
+                    break
 
     ws.close()
 
-    boardimg = BytesIO(requests.get(file, stream=True).content)
-    logging.info(f"Received board image: {file}")
+    boardimgs = [BytesIO(requests.get(file, stream=True).content) for file in files]
+    logging.info(f"Received board images: {files[0]}, {files[1]}")
 
-    return boardimg
+    return boardimgs
 
 
-def get_unset_pixel(boardimg, x, y):
+def get_unset_pixel(boardimgs, x, y):
     pixel_x_start = int(os.getenv("ENV_DRAW_X_START"))
     pixel_y_start = int(os.getenv("ENV_DRAW_Y_START"))
-    pix2 = Image.open(boardimg).convert("RGB").load()
+    boards = [Image.open(boardimg).convert("RGB") for boardimg in boardimgs]
+    pix2 = Image.new("RGB", (2000, 1000), 0xffffff)
+    pix2.paste(boards[0], (0, 0))
+    pix2.paste(boards[1], (1000, 0))
     num_loops = 0
     while True:
         x += 1
@@ -209,23 +271,23 @@ def get_unset_pixel(boardimg, x, y):
 
         if y >= image_height:
             if num_loops > 1:
-                target_rgb = pix[0, 0]
-                new_rgb = closest_color(target_rgb, rgb_colors_array)
-                return 0, 0, new_rgb
+                return None, None, None
             y = 0
             num_loops += 1
         logging.debug(f"{x+pixel_x_start}, {y+pixel_y_start}")
         logging.debug(f"{x}, {y}, boardimg, {image_width}, {image_height}")
 
         target_rgb = pix[x, y]
+        if target_rgb[3] == 0:
+            continue
         new_rgb = closest_color(target_rgb, rgb_colors_array)
-        if pix2[x + pixel_x_start, y + pixel_y_start] != new_rgb:
+        if pix2.getpixel((x + pixel_x_start, y + pixel_y_start))[:3] != new_rgb:
             logging.debug(
-                f"{pix2[x + pixel_x_start, y + pixel_y_start]}, {new_rgb}, {new_rgb != (69, 42, 0)}, {pix2[x, y] != new_rgb,}"
+                f"{pix2.getpixel((x + pixel_x_start, y + pixel_y_start))}, {new_rgb}, {new_rgb != (69, 42, 0)}, {pix2.getpixel((x, y)) != new_rgb,}"
             )
             if new_rgb != (69, 42, 0):
                 logging.debug(
-                    f"Replacing {pix2[x+pixel_x_start, y+pixel_y_start]} pixel at: {x+pixel_x_start},{y+pixel_y_start} with {new_rgb} color"
+                    f"Replacing {pix2.getpixel((x + pixel_x_start, y + pixel_y_start))} pixel at: {x+pixel_x_start},{y+pixel_y_start} with {new_rgb} color"
                 )
                 break
             else:
@@ -286,16 +348,17 @@ def task(credentials_index):
         # global variables for script
         # note: reddit limits us to place 1 pixel every 5 minutes, so I am setting it to
         # 5 minutes and 30 seconds per pixel
-        # pixel_place_frequency = 330
-        if os.getenv("ENV_UNVERIFIED_PLACE_FREQUENCY") is not None:
-            if bool(os.getenv("ENV_UNVERIFIED_PLACE_FREQUENCY")):
-                pixel_place_frequency = 1230
-            else:
-                pixel_place_frequency = 330
-        else:
-            pixel_place_frequency = 330
-
-        next_pixel_placement_time = math.floor(time.time()) + pixel_place_frequency
+        # # pixel_place_frequency = 330
+        # if os.getenv("ENV_UNVERIFIED_PLACE_FREQUENCY") is not None:
+        #     if bool(os.getenv("ENV_UNVERIFIED_PLACE_FREQUENCY")):
+        #         pixel_place_frequency = 1230
+        #     else:
+        #         pixel_place_frequency = 330
+        # else:
+        #     pixel_place_frequency = 330
+        #
+        # next_pixel_placement_time = math.floor(time.time()) + pixel_place_frequency
+        next_pixel_placement_time = None
 
         # pixel drawing preferences
         pixel_x_start = int(os.getenv("ENV_DRAW_X_START"))
@@ -329,19 +392,10 @@ def task(credentials_index):
         # refresh auth tokens and / or draw a pixel
         while True:
             # reduce CPU usage
-            time.sleep(1)
+            time.sleep(10)
 
             # get the current time
             current_timestamp = math.floor(time.time())
-
-            # log next time until drawing
-            time_until_next_draw = next_pixel_placement_time - current_timestamp
-            new_update_str = (
-                str(time_until_next_draw) + " seconds until next pixel is drawn"
-            )
-            if update_str != new_update_str and time_until_next_draw % 10 == 0:
-                update_str = new_update_str
-                logging.info(f"Thread #{credentials_index} :: {update_str}")
 
             # refresh access token if necessary
             if (
@@ -408,11 +462,18 @@ def task(credentials_index):
                     f"Received new access token: {access_tokens[credentials_index][:5]}************"
                 )
 
+            if next_pixel_placement_time is None:
+                next_pixel_placement_time = get_timeout(access_tokens[credentials_index])
+
+            # log next time until drawing
+            time_until_next_draw = (next_pixel_placement_time - datetime.now()).total_seconds()
+            update_str = (
+                    str(time_until_next_draw) + " seconds until next pixel is drawn"
+            )
+            logging.info(f"Thread #{credentials_index} :: {update_str}")
+
             # draw pixel onto screen
-            if access_tokens[credentials_index] is not None and (
-                current_timestamp >= next_pixel_placement_time
-                or first_run_counter <= credentials_index
-            ):
+            if access_tokens[credentials_index] is not None and time_until_next_draw < 0:
 
                 # place pixel immediately
                 # first_run = False
@@ -424,9 +485,14 @@ def task(credentials_index):
                 # get current pixel position from input image and replacement color
                 current_r, current_c, new_rgb = get_unset_pixel(
                     get_board(access_tokens[credentials_index]),
-                    current_r,
-                    current_c,
+                    random.randrange(0, image_width),
+                    random.randrange(0, image_height),
                 )
+
+                if current_r is None:
+                    logging.info(f"Thread #{credentials_index} :: No pixels to fix found!")
+                    time.sleep(10)
+                    continue
 
                 # get converted color
                 new_rgb_hex = rgb_to_hex(new_rgb)
