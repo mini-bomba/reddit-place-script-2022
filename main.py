@@ -2,6 +2,7 @@ import os
 import os.path
 import math
 from datetime import datetime
+from typing import Optional
 
 import requests
 import json
@@ -123,7 +124,7 @@ def set_pixel_and_check_ratelimit(
     # code.interact(local=locals())
 
     # Reddit returns time in ms and we need seconds, so divide by 1000
-    return datetime.fromtimestamp(waitTime / 1000)
+    return datetime.fromtimestamp(waitTime / 1000 + 10)
 
 
 def get_timeout(access_token_in):
@@ -151,7 +152,7 @@ def get_timeout(access_token_in):
     response = requests.request("POST", url, headers=headers, data=payload)
     logging.debug(f"Received response: {response.text}")
     data = response.json()['data']['act']['data'][0]['data']
-    return datetime.fromtimestamp(data['nextAvailablePixelTimestamp'] / 1000) \
+    return datetime.fromtimestamp(data['nextAvailablePixelTimestamp'] / 1000 + 10) \
         if data['nextAvailablePixelTimestamp'] is not None else datetime.now()
 
 
@@ -235,6 +236,50 @@ def get_board(access_token_in):
             }
         )
     )
+    ws.send(
+        json.dumps(
+            {
+                "id": "2",
+                "type": "start",
+                "payload": {
+                    "variables": {
+                        "input": {
+                            "channel": {
+                                "teamOwner": "AFD2022",
+                                "category": "CANVAS",
+                                "tag": "2",
+                            }
+                        }
+                    },
+                    "extensions": {},
+                    "operationName": "replace",
+                    "query": "subscription replace($input: SubscribeInput!) {\n  subscribe(input: $input) {\n    id\n    ... on BasicMessage {\n      data {\n        __typename\n        ... on FullFrameMessageData {\n          __typename\n          name\n          timestamp\n        }\n        ... on DiffFrameMessageData {\n          __typename\n          name\n          currentTimestamp\n          previousTimestamp\n        }\n      }\n      __typename\n    }\n    __typename\n  }\n}\n",
+                },
+            }
+        )
+    )
+    ws.send(
+        json.dumps(
+            {
+                "id": "2",
+                "type": "start",
+                "payload": {
+                    "variables": {
+                        "input": {
+                            "channel": {
+                                "teamOwner": "AFD2022",
+                                "category": "CANVAS",
+                                "tag": "3",
+                            }
+                        }
+                    },
+                    "extensions": {},
+                    "operationName": "replace",
+                    "query": "subscription replace($input: SubscribeInput!) {\n  subscribe(input: $input) {\n    id\n    ... on BasicMessage {\n      data {\n        __typename\n        ... on FullFrameMessageData {\n          __typename\n          name\n          timestamp\n        }\n        ... on DiffFrameMessageData {\n          __typename\n          name\n          currentTimestamp\n          previousTimestamp\n        }\n      }\n      __typename\n    }\n    __typename\n  }\n}\n",
+                },
+            }
+        )
+    )
 
     files = []
     while True:
@@ -243,56 +288,52 @@ def get_board(access_token_in):
             msg = temp["payload"]["data"]["subscribe"]
             if msg["data"]["__typename"] == "FullFrameMessageData":
                 files.append(msg["data"]["name"])
-                if len(files) >= 2:
+                if len(files) >= 4:
                     break
 
     ws.close()
 
-    boardimgs = [BytesIO(requests.get(file, stream=True).content) for file in files]
-    logging.info(f"Received board images: {files[0]}, {files[1]}")
+    files = list(sorted(files, key=lambda file: int(file[64])))
 
-    return boardimgs
+    logging.info(f"Received board images: {files}")
+    boards = [Image.open(BytesIO(requests.get(file, stream=True).content)).convert("RGB") for file in files]
+    combined_board = Image.new("RGB", (2000, 2000), 0xffffff)
+    combined_board.paste(boards[0], (0, 0))
+    combined_board.paste(boards[1], (1000, 0))
+    combined_board.paste(boards[2], (0, 1000))
+    combined_board.paste(boards[3], (1000, 1000))
+    return combined_board
 
 
-def get_unset_pixel(boardimgs, x, y):
-    pixel_x_start = int(os.getenv("ENV_DRAW_X_START"))
-    pixel_y_start = int(os.getenv("ENV_DRAW_Y_START"))
-    boards = [Image.open(boardimg).convert("RGB") for boardimg in boardimgs]
-    pix2 = Image.new("RGB", (2000, 1000), 0xffffff)
-    pix2.paste(boards[0], (0, 0))
-    pix2.paste(boards[1], (1000, 0))
-    num_loops = 0
-    while True:
-        x += 1
+pixel_queue = []
+pixel_queue_timestamp = datetime.fromtimestamp(0)
+pixel_queue_lock = threading.Lock()
 
-        if x >= image_width:
-            y += 1
-            x = 0
 
-        if y >= image_height:
-            if num_loops > 1:
-                return None, None, None
-            y = 0
-            num_loops += 1
-        logging.debug(f"{x+pixel_x_start}, {y+pixel_y_start}")
-        logging.debug(f"{x}, {y}, boardimg, {image_width}, {image_height}")
+def get_unset_pixel(access_token):
+    global pixel_queue, pixel_queue_timestamp, pixel_queue_lock
+    with pixel_queue_lock:
+        if (datetime.now() - pixel_queue_timestamp).total_seconds() > 5:
+            logging.info("Refreshing pixel queue")
+            pixel_x_start = int(os.getenv("ENV_DRAW_X_START"))
+            pixel_y_start = int(os.getenv("ENV_DRAW_Y_START"))
+            board = get_board(access_token)
+            pixel_queue = []
+            for x in range(image_width):
+                for y in range(image_height):
+                    target = pix.getpixel((x, y))
+                    new_rgb = closest_color(target, rgb_colors_array)
+                    if board.getpixel((x + pixel_x_start, y + pixel_y_start))[:3] != new_rgb:
+                        pixel_queue.append((x, y, new_rgb))
+            random.shuffle(pixel_queue)
+            logging.info(f"Identified {len(pixel_queue)} pixels to fix")
+            pixel_queue_timestamp = datetime.now()
 
-        target_rgb = pix[x, y]
-        if target_rgb[3] == 0:
-            continue
-        new_rgb = closest_color(target_rgb, rgb_colors_array)
-        if pix2.getpixel((x + pixel_x_start, y + pixel_y_start))[:3] != new_rgb:
-            logging.debug(
-                f"{pix2.getpixel((x + pixel_x_start, y + pixel_y_start))}, {new_rgb}, {new_rgb != (69, 42, 0)}, {pix2.getpixel((x, y)) != new_rgb,}"
-            )
-            if new_rgb != (69, 42, 0):
-                logging.debug(
-                    f"Replacing {pix2.getpixel((x + pixel_x_start, y + pixel_y_start))} pixel at: {x+pixel_x_start},{y+pixel_y_start} with {new_rgb} color"
-                )
-                break
-            else:
-                print("TransparrentPixel")
-    return x, y, new_rgb
+        if len(pixel_queue) <= 0:
+            logging.info("Queue empty!")
+            return None, None, None
+        logging.info("Returning from pixel queue")
+        return pixel_queue.pop()
 
 
 # method to define the color palette array
@@ -332,10 +373,9 @@ def load_image():
         sys.exit("No valid image path found!")
 
     print("Loading image from " + image_path)
-    im = Image.open(image_path)
-    pix = im.load()
-    logging.info(f"Loaded image size: {im.size}")
-    image_width, image_height = im.size
+    pix = Image.open(image_path)
+    logging.info(f"Loaded image size: {pix.size}")
+    image_width, image_height = pix.size
 
 
 # task to draw the input image
@@ -483,15 +523,11 @@ def task(credentials_index):
                 # target_rgb = pix[current_r, current_c]
 
                 # get current pixel position from input image and replacement color
-                current_r, current_c, new_rgb = get_unset_pixel(
-                    get_board(access_tokens[credentials_index]),
-                    random.randrange(0, image_width),
-                    random.randrange(0, image_height),
-                )
+                current_r, current_c, new_rgb = get_unset_pixel(access_tokens[credentials_index])
 
                 if current_r is None:
                     logging.info(f"Thread #{credentials_index} :: No pixels to fix found!")
-                    time.sleep(10)
+                    time.sleep(random.randint(5, 30))
                     continue
 
                 # get converted color
@@ -584,9 +620,9 @@ ENV_C_START='["0"]\'"""
     access_token_expires_at_timestamp = []
 
     # image.jpg information
-    pix = None
-    image_width = None
-    image_height = None
+    pix: Image.Image = None
+    image_width: int = 0
+    image_height: int = 0
 
     # place a pixel immediately
     # first_run = True
