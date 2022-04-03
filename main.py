@@ -63,7 +63,10 @@ def set_pixel_and_check_ratelimit(
     canvas_index = 0
     if x >= 1000:
         x -= 1000
-        canvas_index = 1
+        canvas_index += 1
+    if y >= 1000:
+        y -= 1000
+        canvas_index += 2
 
 
     url = "https://gql-realtime-2.reddit.com/query"
